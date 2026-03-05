@@ -9,7 +9,6 @@ import pandas as pd
 import altair as alt
 import json
 from datetime import timedelta
-import _snowflake
 
 st.set_page_config(
     page_title="Foodex Buyer Dashboard",
@@ -108,6 +107,26 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] {
     font-weight: 600;
     font-size: 0.95rem;
     border-radius: 10px;
+}
+
+/* ---------- アイコンフォント文字化け非表示 ---------- */
+span[data-testid="stIconMaterial"],
+[class*="keyboard"],
+[class*="arrow"],
+[data-baseweb="icon"],
+.material-icons,
+span:has(> svg[data-testid]),
+div[data-testid="stExpanderToggleIcon"] {
+    display: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+    height: 0 !important;
+    overflow: hidden !important;
+}
+
+/* Keyboard文字化け強制非表示 */
+body *:not(script):not(style) {
+    font-variant-ligatures: none;
 }
 
 /* ---------- チャットメッセージ ---------- */
@@ -602,153 +621,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # タブ
-tab_ai, tab1, tab2, tab3, tab4 = st.tabs([
-    "AI アシスタント",
+tab1, tab2, tab3, tab4 = st.tabs([
     "売上概要",
     "商品分析",
     "在庫状況",
     "商品検索",
 ])
-
-# ---------------------------------------------------------------------------
-# AIアシスタントタブ (Cortex Analyst)
-# ---------------------------------------------------------------------------
-with tab_ai:
-    st.markdown("""
-    <div class="section-header">
-        <div class="icon purple">🤖</div>
-        <h3>Foodex バイヤーアシスタント</h3>
-    </div>
-    """, unsafe_allow_html=True)
-    st.caption("売上分析、在庫確認、商品検索など — 自然言語で質問できます")
-
-    sample_questions = [
-        "飲料カテゴリで売上トップ10",
-        "新商品で一番売れている商品",
-        "欠品リスクのある商品",
-    ]
-
-    cols_sample = st.columns(len(sample_questions))
-    for i, q in enumerate(sample_questions):
-        with cols_sample[i]:
-            if st.button(q, key=f"sample_{i}", use_container_width=True):
-                st.session_state.agent_input = q
-
-    st.markdown("")
-
-    if "agent_messages" not in st.session_state:
-        st.session_state.agent_messages = []
-
-    for msg in st.session_state.agent_messages:
-        with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "user" else "🤖"):
-            st.markdown(msg["content"])
-            if "data" in msg and msg["data"] is not None:
-                st.dataframe(msg["data"], use_container_width=True, hide_index=True)
-
-    default_input = st.session_state.pop("agent_input", None)
-    user_input = st.chat_input("質問を入力してください…", key="agent_chat")
-    if default_input:
-        user_input = default_input
-
-    if user_input:
-        st.session_state.agent_messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user", avatar="🧑‍💼"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("分析中…"):
-                try:
-                    # Cortex Agent REST API 呼び出し
-                    request_body = {
-                        "model": "claude-3-5-sonnet",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": user_input
-                            }
-                        ],
-                        "tools": [
-                            {
-                                "tool_spec": {
-                                    "type": "cortex_analyst_text_to_sql",
-                                    "name": "analyst_tool"
-                                }
-                            }
-                        ],
-                        "tool_resources": {
-                            "analyst_tool": {
-                                "semantic_model_file": "@FOODEX_DEMO.BUYER_AGENT.SEMANTIC_MODEL/foodex_semantic_model.yaml"
-                            }
-                        }
-                    }
-                    
-                    response = _snowflake.send_snow_api_request(
-                        "POST",
-                        "/api/v2/cortex/agent:run",
-                        {},
-                        {},
-                        request_body,
-                        {},
-                        60000  # timeout in ms
-                    )
-                    
-                    response_content = json.loads(response["content"])
-                    
-                    assistant_message = ""
-                    data_df = None
-                    
-                    # レスポンスからメッセージとSQLを抽出
-                    if isinstance(response_content, dict):
-                        # Agent レスポンス形式の処理
-                        choices = response_content.get("choices", [])
-                        if choices:
-                            message = choices[0].get("message", {})
-                            content = message.get("content", "")
-                            
-                            if content:
-                                assistant_message = content
-                            
-                            # tool_results からSQL結果を取得
-                            tool_results = message.get("tool_results", [])
-                            for tool_result in tool_results:
-                                if tool_result.get("type") == "cortex_analyst_text_to_sql":
-                                    sql_content = tool_result.get("content", [])
-                                    for item in sql_content:
-                                        if item.get("type") == "sql":
-                                            sql_statement = item.get("statement", "")
-                                            if sql_statement:
-                                                try:
-                                                    data_df = session.sql(sql_statement).to_pandas()
-                                                except Exception as sql_err:
-                                                    assistant_message += f"\n\nSQLエラー: {sql_err}"
-                                        elif item.get("type") == "text" and not assistant_message:
-                                            assistant_message = item.get("text", "")
-                        
-                        # エラーメッセージのチェック
-                        if not assistant_message and "error" in response_content:
-                            assistant_message = f"エラー: {response_content['error']}"
-                    
-                    if not assistant_message:
-                        assistant_message = "回答を生成できませんでした。"
-
-                    st.markdown(assistant_message)
-                    if data_df is not None and not data_df.empty:
-                        st.dataframe(data_df, use_container_width=True, hide_index=True)
-
-                    st.session_state.agent_messages.append({
-                        "role": "assistant",
-                        "content": assistant_message,
-                        "data": data_df,
-                    })
-                except Exception as e:
-                    error_msg = f"エラー: {e}"
-                    st.error(error_msg)
-                    st.session_state.agent_messages.append({"role": "assistant", "content": error_msg})
-
-    if st.session_state.agent_messages:
-        if st.button("履歴をクリア", key="clear_chat"):
-            st.session_state.agent_messages = []
-            st.rerun()
 
 # ---------------------------------------------------------------------------
 # タブ1: 売上概要
