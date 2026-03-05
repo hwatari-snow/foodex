@@ -9,6 +9,7 @@ import pandas as pd
 import altair as alt
 import json
 from datetime import timedelta
+import _snowflake
 
 st.set_page_config(
     page_title="Foodex Buyer Dashboard",
@@ -657,38 +658,76 @@ with tab_ai:
         with st.chat_message("assistant", avatar="🤖"):
             with st.spinner("分析中…"):
                 try:
-                    escaped_input = user_input.replace("'", "''").replace("\\", "\\\\")
-
-                    analyst_result = session.sql(f"""
-                        SELECT SNOWFLAKE.CORTEX.ANALYST(
-                            'FOODEX_DEMO.BUYER_AGENT.FOODEX_BUYER_ANALYSIS',
-                            '{escaped_input}'
-                        ) as RESPONSE
-                    """).collect()
-
-                    response_json = analyst_result[0]["RESPONSE"]
-                    response_data = json.loads(response_json) if isinstance(response_json, str) else response_json
-
+                    # Cortex Agent REST API 呼び出し
+                    request_body = {
+                        "model": "claude-3-5-sonnet",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": user_input
+                            }
+                        ],
+                        "tools": [
+                            {
+                                "tool_spec": {
+                                    "type": "cortex_analyst_text_to_sql",
+                                    "name": "analyst_tool"
+                                }
+                            }
+                        ],
+                        "tool_resources": {
+                            "analyst_tool": {
+                                "semantic_model_file": "@FOODEX_DEMO.BUYER_AGENT.SEMANTIC_MODEL/foodex_semantic_model.yaml"
+                            }
+                        }
+                    }
+                    
+                    response = _snowflake.send_snow_api_request(
+                        "POST",
+                        "/api/v2/cortex/agent:run",
+                        {},
+                        {},
+                        request_body,
+                        {},
+                        60000  # timeout in ms
+                    )
+                    
+                    response_content = json.loads(response["content"])
+                    
                     assistant_message = ""
                     data_df = None
-
-                    if isinstance(response_data, dict):
-                        if "sql" in response_data:
-                            try:
-                                data_df = session.sql(response_data["sql"]).to_pandas()
-                            except Exception as sql_err:
-                                assistant_message = f"SQLエラー: {sql_err}"
-
-                        for key in ("message", "interpretation", "explanation", "answer"):
-                            if response_data.get(key):
-                                assistant_message = response_data[key]
-                                break
-
-                        if not assistant_message and data_df is not None:
-                            assistant_message = f"分析結果（{len(data_df)}件）:"
-                    else:
-                        assistant_message = str(response_data)
-
+                    
+                    # レスポンスからメッセージとSQLを抽出
+                    if isinstance(response_content, dict):
+                        # Agent レスポンス形式の処理
+                        choices = response_content.get("choices", [])
+                        if choices:
+                            message = choices[0].get("message", {})
+                            content = message.get("content", "")
+                            
+                            if content:
+                                assistant_message = content
+                            
+                            # tool_results からSQL結果を取得
+                            tool_results = message.get("tool_results", [])
+                            for tool_result in tool_results:
+                                if tool_result.get("type") == "cortex_analyst_text_to_sql":
+                                    sql_content = tool_result.get("content", [])
+                                    for item in sql_content:
+                                        if item.get("type") == "sql":
+                                            sql_statement = item.get("statement", "")
+                                            if sql_statement:
+                                                try:
+                                                    data_df = session.sql(sql_statement).to_pandas()
+                                                except Exception as sql_err:
+                                                    assistant_message += f"\n\nSQLエラー: {sql_err}"
+                                        elif item.get("type") == "text" and not assistant_message:
+                                            assistant_message = item.get("text", "")
+                        
+                        # エラーメッセージのチェック
+                        if not assistant_message and "error" in response_content:
+                            assistant_message = f"エラー: {response_content['error']}"
+                    
                     if not assistant_message:
                         assistant_message = "回答を生成できませんでした。"
 
