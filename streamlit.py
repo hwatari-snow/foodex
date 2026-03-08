@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 import json
+import math
 from datetime import timedelta
 
 st.set_page_config(
@@ -580,6 +581,130 @@ def search_products(keyword, category, manufacturer):
         ORDER BY PRODUCT_NAME
     """)
 
+
+@st.cache_data(ttl=300)
+def get_product_list_for_lineage():
+    """リネージ用商品一覧を取得"""
+    return run_query("""
+        SELECT PRODUCT_ID, PRODUCT_NAME, CATEGORY_LARGE, BRAND_NAME
+        FROM FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER
+        ORDER BY CATEGORY_LARGE, PRODUCT_NAME
+    """)
+
+
+@st.cache_data(ttl=60)
+def get_hierarchical_co_purchase(root_product_id, start_date, end_date, depth=3, top_n=5):
+    """階層型併売データを取得（3段階）"""
+    
+    # レベル1: ルート商品と直接併売される商品
+    level1_query = f"""
+    WITH root_baskets AS (
+        SELECT DISTINCT BASKET_ID
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS
+        WHERE PRODUCT_ID = '{root_product_id}'
+          AND TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+    )
+    SELECT 
+        '{root_product_id}' as PARENT_ID,
+        t.PRODUCT_ID as CHILD_ID,
+        p.PRODUCT_NAME as CHILD_NAME,
+        p.CATEGORY_LARGE as CHILD_CATEGORY,
+        p.BRAND_NAME as CHILD_BRAND,
+        COUNT(DISTINCT t.BASKET_ID) as CO_PURCHASE_COUNT,
+        1 as LEVEL
+    FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS t
+    JOIN FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER p ON t.PRODUCT_ID = p.PRODUCT_ID
+    WHERE t.BASKET_ID IN (SELECT BASKET_ID FROM root_baskets)
+      AND t.PRODUCT_ID != '{root_product_id}'
+      AND t.TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+    GROUP BY t.PRODUCT_ID, p.PRODUCT_NAME, p.CATEGORY_LARGE, p.BRAND_NAME
+    ORDER BY CO_PURCHASE_COUNT DESC
+    LIMIT {top_n}
+    """
+    
+    level1_df = run_query(level1_query)
+    
+    if level1_df.empty or depth < 2:
+        return level1_df
+    
+    all_levels = [level1_df]
+    
+    # レベル2: レベル1の各商品と併売される商品
+    level1_products = level1_df['CHILD_ID'].tolist()
+    for parent_id in level1_products:
+        level2_query = f"""
+        WITH parent_baskets AS (
+            SELECT DISTINCT BASKET_ID
+            FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS
+            WHERE PRODUCT_ID = '{parent_id}'
+              AND TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+        )
+        SELECT 
+            '{parent_id}' as PARENT_ID,
+            t.PRODUCT_ID as CHILD_ID,
+            p.PRODUCT_NAME as CHILD_NAME,
+            p.CATEGORY_LARGE as CHILD_CATEGORY,
+            p.BRAND_NAME as CHILD_BRAND,
+            COUNT(DISTINCT t.BASKET_ID) as CO_PURCHASE_COUNT,
+            2 as LEVEL
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS t
+        JOIN FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER p ON t.PRODUCT_ID = p.PRODUCT_ID
+        WHERE t.BASKET_ID IN (SELECT BASKET_ID FROM parent_baskets)
+          AND t.PRODUCT_ID != '{parent_id}'
+          AND t.PRODUCT_ID != '{root_product_id}'
+          AND t.PRODUCT_ID NOT IN ({','.join([f"'{x}'" for x in level1_products])})
+          AND t.TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY t.PRODUCT_ID, p.PRODUCT_NAME, p.CATEGORY_LARGE, p.BRAND_NAME
+        ORDER BY CO_PURCHASE_COUNT DESC
+        LIMIT {top_n}
+        """
+        level2_df = run_query(level2_query)
+        if not level2_df.empty:
+            all_levels.append(level2_df)
+    
+    if depth < 3:
+        return pd.concat(all_levels, ignore_index=True)
+    
+    # レベル3: レベル2の各商品と併売される商品
+    level2_all = pd.concat(all_levels[1:], ignore_index=True) if len(all_levels) > 1 else pd.DataFrame()
+    if level2_all.empty:
+        return pd.concat(all_levels, ignore_index=True)
+    
+    level2_products = level2_all['CHILD_ID'].unique().tolist()
+    excluded_products = [root_product_id] + level1_products + level2_products
+    
+    for parent_id in level2_products[:top_n*2]:  # レベル3は上位のみ
+        level3_query = f"""
+        WITH parent_baskets AS (
+            SELECT DISTINCT BASKET_ID
+            FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS
+            WHERE PRODUCT_ID = '{parent_id}'
+              AND TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+        )
+        SELECT 
+            '{parent_id}' as PARENT_ID,
+            t.PRODUCT_ID as CHILD_ID,
+            p.PRODUCT_NAME as CHILD_NAME,
+            p.CATEGORY_LARGE as CHILD_CATEGORY,
+            p.BRAND_NAME as CHILD_BRAND,
+            COUNT(DISTINCT t.BASKET_ID) as CO_PURCHASE_COUNT,
+            3 as LEVEL
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS t
+        JOIN FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER p ON t.PRODUCT_ID = p.PRODUCT_ID
+        WHERE t.BASKET_ID IN (SELECT BASKET_ID FROM parent_baskets)
+          AND t.PRODUCT_ID NOT IN ({','.join([f"'{x}'" for x in excluded_products])})
+          AND t.TRANSACTION_DATE BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY t.PRODUCT_ID, p.PRODUCT_NAME, p.CATEGORY_LARGE, p.BRAND_NAME
+        ORDER BY CO_PURCHASE_COUNT DESC
+        LIMIT {max(2, top_n // 2)}
+        """
+        level3_df = run_query(level3_query)
+        if not level3_df.empty:
+            all_levels.append(level3_df)
+    
+    return pd.concat(all_levels, ignore_index=True)
+
+
 # ---------------------------------------------------------------------------
 # サイドバー：フィルター
 # ---------------------------------------------------------------------------
@@ -670,11 +795,12 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # タブ
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "売上概要",
     "商品分析",
     "在庫状況",
     "商品検索",
+    "併売リネージ",
 ])
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1228,290 @@ with tab4:
             st.info("該当する商品が見つかりませんでした")
     else:
         st.info("検索条件を入力してください")
+
+# ---------------------------------------------------------------------------
+# タブ5: 併売リネージ
+# ---------------------------------------------------------------------------
+with tab5:
+    st.markdown("""
+    <div class="section-header">
+        <div class="icon purple">🔗</div>
+        <h3>併売リネージ分析</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("商品を選択すると、その商品と一緒に買われやすい商品を3段階の階層で可視化します。")
+    
+    # 商品選択
+    product_list_df = get_product_list_for_lineage()
+    product_options = {
+        f"{row['PRODUCT_NAME']} [{row['CATEGORY_LARGE']}]": row['PRODUCT_ID']
+        for _, row in product_list_df.iterrows()
+    }
+    
+    col_select, col_settings = st.columns([3, 2])
+    
+    with col_select:
+        selected_root_product = st.selectbox(
+            "起点となる商品を選択",
+            options=[""] + list(product_options.keys()),
+            key="lineage_product_select",
+            help="この商品を起点に、併売商品の関連性を可視化します"
+        )
+    
+    with col_settings:
+        top_n_children = st.slider(
+            "各階層の表示数",
+            min_value=3,
+            max_value=8,
+            value=5,
+            help="各レベルで表示する関連商品数"
+        )
+    
+    if selected_root_product:
+        root_product_id = product_options[selected_root_product]
+        root_product_name = selected_root_product.split(' [')[0]
+        
+        with st.spinner("リネージデータを取得中..."):
+            try:
+                lineage_df = get_hierarchical_co_purchase(
+                    root_product_id, 
+                    start_date, 
+                    end_date, 
+                    depth=3, 
+                    top_n=top_n_children
+                )
+                
+                if lineage_df.empty:
+                    st.warning("この商品の併売データが見つかりませんでした。期間を広げるか、別の商品を選択してください。")
+                else:
+                    st.success(f"「{root_product_name}」を起点に {len(lineage_df)} 件の関連商品を検出しました")
+                    
+                    # 統計メトリクス
+                    metric_cols = st.columns(4)
+                    with metric_cols[0]:
+                        level1_count = len(lineage_df[lineage_df['LEVEL'] == 1])
+                        st.metric("Level 1 商品数", level1_count)
+                    with metric_cols[1]:
+                        level2_count = len(lineage_df[lineage_df['LEVEL'] == 2])
+                        st.metric("Level 2 商品数", level2_count)
+                    with metric_cols[2]:
+                        level3_count = len(lineage_df[lineage_df['LEVEL'] == 3])
+                        st.metric("Level 3 商品数", level3_count)
+                    with metric_cols[3]:
+                        total_co_purchase = lineage_df['CO_PURCHASE_COUNT'].sum()
+                        st.metric("総併売回数", f"{total_co_purchase:,}")
+                    
+                    st.markdown("---")
+                    
+                    # ===== 階層型ツリービジュアライゼーション =====
+                    st.subheader("併売リネージ図")
+                    st.caption("上から下へ: 選択商品 → 直接関連商品 → 2次関連商品 → 3次関連商品")
+                    
+                    # ノードとエッジのデータ構築
+                    nodes_data = []
+                    edges_data = []
+                    
+                    # ルートノード (Level 0)
+                    root_info = product_list_df[product_list_df['PRODUCT_ID'] == root_product_id].iloc[0]
+                    nodes_data.append({
+                        'id': root_product_id,
+                        'name': root_product_name[:20] + ('...' if len(root_product_name) > 20 else ''),
+                        'full_name': root_product_name,
+                        'category': root_info['CATEGORY_LARGE'],
+                        'level': 0,
+                        'co_purchase': 0,
+                        'x': 0,
+                        'y': 0
+                    })
+                    
+                    # レベルごとにノードを配置
+                    level_y_positions = {0: 0, 1: 150, 2: 300, 3: 450}
+                    
+                    for level in [1, 2, 3]:
+                        level_data = lineage_df[lineage_df['LEVEL'] == level]
+                        if level_data.empty:
+                            continue
+                        
+                        # 親ごとにグループ化
+                        parent_groups = level_data.groupby('PARENT_ID')
+                        
+                        # 全体のX座標計算用
+                        all_nodes_at_level = []
+                        
+                        for parent_id, group in parent_groups:
+                            n_children = len(group)
+                            
+                            # 親ノードのX座標を取得
+                            parent_node = next((n for n in nodes_data if n['id'] == parent_id), None)
+                            parent_x = parent_node['x'] if parent_node else 0
+                            
+                            # 子ノードを親の下に配置
+                            spread = min(120, 400 / max(1, n_children))
+                            start_x = parent_x - (n_children - 1) * spread / 2
+                            
+                            for i, (_, row) in enumerate(group.iterrows()):
+                                child_x = start_x + i * spread
+                                all_nodes_at_level.append({
+                                    'id': row['CHILD_ID'],
+                                    'name': row['CHILD_NAME'][:18] + ('...' if len(row['CHILD_NAME']) > 18 else ''),
+                                    'full_name': row['CHILD_NAME'],
+                                    'category': row['CHILD_CATEGORY'],
+                                    'level': level,
+                                    'co_purchase': row['CO_PURCHASE_COUNT'],
+                                    'x': child_x,
+                                    'y': level_y_positions[level],
+                                    'parent_id': parent_id
+                                })
+                        
+                        # 重複除去（同じ商品が複数の親から参照される場合）
+                        seen_ids = set()
+                        for node in all_nodes_at_level:
+                            if node['id'] not in seen_ids:
+                                nodes_data.append(node)
+                                seen_ids.add(node['id'])
+                                
+                                # エッジ追加
+                                parent_node = next((n for n in nodes_data if n['id'] == node['parent_id']), None)
+                                if parent_node:
+                                    edges_data.append({
+                                        'x': parent_node['x'],
+                                        'y': parent_node['y'],
+                                        'x2': node['x'],
+                                        'y2': node['y'],
+                                        'parent': parent_node['full_name'],
+                                        'child': node['full_name'],
+                                        'count': node['co_purchase']
+                                    })
+                    
+                    # X座標を中央揃え
+                    if nodes_data:
+                        all_x = [n['x'] for n in nodes_data]
+                        min_x, max_x = min(all_x), max(all_x)
+                        offset_x = 400 - (min_x + max_x) / 2
+                        for node in nodes_data:
+                            node['x'] += offset_x
+                        for edge in edges_data:
+                            edge['x'] += offset_x
+                            edge['x2'] += offset_x
+                    
+                    nodes_df = pd.DataFrame(nodes_data)
+                    edges_df = pd.DataFrame(edges_data) if edges_data else pd.DataFrame()
+                    
+                    # カラーマップ（レベル別）
+                    level_colors = {0: '#6366f1', 1: '#3b82f6', 2: '#10b981', 3: '#f59e0b'}
+                    nodes_df['color'] = nodes_df['level'].map(level_colors)
+                    nodes_df['size'] = nodes_df['level'].apply(lambda x: 800 if x == 0 else 500 - x * 100)
+                    
+                    # エッジ描画
+                    if not edges_df.empty:
+                        max_count = edges_df['count'].max() if not edges_df.empty else 1
+                        edges_df['stroke_width'] = edges_df['count'].apply(lambda x: max(1, (x / max_count) * 5))
+                        
+                        edges_chart = alt.Chart(edges_df).mark_rule(
+                            opacity=0.5,
+                            color='#94a3b8'
+                        ).encode(
+                            x=alt.X('x:Q', scale=alt.Scale(domain=[0, 800]), axis=None),
+                            y=alt.Y('y:Q', scale=alt.Scale(domain=[-30, 500]), axis=None),
+                            x2='x2:Q',
+                            y2='y2:Q',
+                            strokeWidth=alt.StrokeWidth('stroke_width:Q', legend=None),
+                            tooltip=[
+                                alt.Tooltip('parent:N', title='親商品'),
+                                alt.Tooltip('child:N', title='子商品'),
+                                alt.Tooltip('count:Q', title='併売回数')
+                            ]
+                        )
+                    else:
+                        edges_chart = alt.Chart(pd.DataFrame({'x': [0]})).mark_point(opacity=0)
+                    
+                    # ノード描画
+                    nodes_chart = alt.Chart(nodes_df).mark_circle().encode(
+                        x=alt.X('x:Q', axis=None),
+                        y=alt.Y('y:Q', axis=None),
+                        size=alt.Size('size:Q', legend=None),
+                        color=alt.Color('level:N',
+                            scale=alt.Scale(
+                                domain=[0, 1, 2, 3],
+                                range=['#6366f1', '#3b82f6', '#10b981', '#f59e0b']
+                            ),
+                            legend=alt.Legend(
+                                title='レベル',
+                                orient='right',
+                                labelExpr="datum.value == 0 ? '起点' : datum.value == 1 ? 'Level 1' : datum.value == 2 ? 'Level 2' : 'Level 3'"
+                            )
+                        ),
+                        tooltip=[
+                            alt.Tooltip('full_name:N', title='商品名'),
+                            alt.Tooltip('category:N', title='カテゴリ'),
+                            alt.Tooltip('co_purchase:Q', title='併売回数')
+                        ]
+                    )
+                    
+                    # ラベル描画
+                    labels_chart = alt.Chart(nodes_df).mark_text(
+                        fontSize=9,
+                        fontWeight='bold',
+                        dy=25
+                    ).encode(
+                        x='x:Q',
+                        y='y:Q',
+                        text='name:N',
+                        color=alt.value('#374151')
+                    )
+                    
+                    # グラフ合成
+                    lineage_chart = (edges_chart + nodes_chart + labels_chart).properties(
+                        width=750,
+                        height=520,
+                        title=alt.TitleParams(
+                            text=f'「{root_product_name[:30]}」の併売リネージ',
+                            subtitle='線が太いほど併売回数が多い / 上から下へ関連が広がる',
+                            fontSize=14,
+                            subtitleFontSize=10,
+                            subtitleColor='#64748b'
+                        )
+                    ).configure_view(
+                        strokeWidth=0
+                    )
+                    
+                    st.altair_chart(lineage_chart, use_container_width=True)
+                    
+                    # レベル別の詳細テーブル
+                    st.markdown("---")
+                    st.subheader("レベル別 関連商品一覧")
+                    
+                    tab_l1, tab_l2, tab_l3 = st.tabs(["Level 1 (直接)", "Level 2 (2次)", "Level 3 (3次)"])
+                    
+                    with tab_l1:
+                        l1_data = lineage_df[lineage_df['LEVEL'] == 1][['CHILD_NAME', 'CHILD_CATEGORY', 'CHILD_BRAND', 'CO_PURCHASE_COUNT']]
+                        if not l1_data.empty:
+                            l1_data.columns = ['商品名', 'カテゴリ', 'ブランド', '併売回数']
+                            st.dataframe(l1_data, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Level 1 の関連商品はありません")
+                    
+                    with tab_l2:
+                        l2_data = lineage_df[lineage_df['LEVEL'] == 2][['CHILD_NAME', 'CHILD_CATEGORY', 'CHILD_BRAND', 'CO_PURCHASE_COUNT']]
+                        if not l2_data.empty:
+                            l2_data.columns = ['商品名', 'カテゴリ', 'ブランド', '併売回数']
+                            st.dataframe(l2_data, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Level 2 の関連商品はありません")
+                    
+                    with tab_l3:
+                        l3_data = lineage_df[lineage_df['LEVEL'] == 3][['CHILD_NAME', 'CHILD_CATEGORY', 'CHILD_BRAND', 'CO_PURCHASE_COUNT']]
+                        if not l3_data.empty:
+                            l3_data.columns = ['商品名', 'カテゴリ', 'ブランド', '併売回数']
+                            st.dataframe(l3_data, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Level 3 の関連商品はありません")
+                    
+            except Exception as e:
+                st.error(f"エラーが発生しました: {str(e)}")
+    else:
+        st.info("商品を選択して、併売リネージを表示してください")
 
 # ---------------------------------------------------------------------------
 # フッター
