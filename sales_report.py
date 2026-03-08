@@ -10,6 +10,8 @@ from snowflake.snowpark.context import get_active_session
 from datetime import datetime
 import io
 import base64
+import altair as alt
+import math
 
 # ページ設定
 st.set_page_config(
@@ -332,6 +334,109 @@ def execute_customer_analysis(
     return session.sql(query).to_pandas(), query
 
 
+@st.cache_data(ttl=60)
+def get_co_purchase_pairs(where_conditions, min_count=50, limit=50):
+    """併売ペアデータを取得"""
+    where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+    
+    query = f"""
+    WITH basket_products AS (
+        SELECT 
+            t.BASKET_ID, 
+            t.PRODUCT_ID,
+            p.PRODUCT_NAME,
+            p.CATEGORY_LARGE
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS t
+        JOIN FOODEX_DEMO.BUYER_AGENT.CUSTOMER_MASTER c ON t.CUSTOMER_ID = c.CUSTOMER_ID
+        JOIN FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER p ON t.PRODUCT_ID = p.PRODUCT_ID
+        WHERE {where_clause}
+    ),
+    product_counts AS (
+        SELECT PRODUCT_ID, COUNT(DISTINCT BASKET_ID) as total_baskets
+        FROM basket_products
+        GROUP BY PRODUCT_ID
+    ),
+    total_baskets AS (
+        SELECT COUNT(DISTINCT BASKET_ID) as total FROM basket_products
+    )
+    SELECT 
+        a.PRODUCT_ID as PRODUCT_A_ID,
+        a.PRODUCT_NAME as PRODUCT_A,
+        a.CATEGORY_LARGE as CATEGORY_A,
+        b.PRODUCT_ID as PRODUCT_B_ID,
+        b.PRODUCT_NAME as PRODUCT_B,
+        b.CATEGORY_LARGE as CATEGORY_B,
+        COUNT(DISTINCT a.BASKET_ID) as CO_PURCHASE_COUNT,
+        ROUND(COUNT(DISTINCT a.BASKET_ID) * 100.0 / pc_a.total_baskets, 1) as CONFIDENCE_A_TO_B,
+        ROUND(COUNT(DISTINCT a.BASKET_ID) * 100.0 / pc_b.total_baskets, 1) as CONFIDENCE_B_TO_A,
+        ROUND(
+            (COUNT(DISTINCT a.BASKET_ID) * 1.0 / tb.total) / 
+            ((pc_a.total_baskets * 1.0 / tb.total) * (pc_b.total_baskets * 1.0 / tb.total)),
+            2
+        ) as LIFT
+    FROM basket_products a
+    JOIN basket_products b 
+        ON a.BASKET_ID = b.BASKET_ID 
+        AND a.PRODUCT_ID < b.PRODUCT_ID
+    JOIN product_counts pc_a ON a.PRODUCT_ID = pc_a.PRODUCT_ID
+    JOIN product_counts pc_b ON b.PRODUCT_ID = pc_b.PRODUCT_ID
+    CROSS JOIN total_baskets tb
+    GROUP BY 
+        a.PRODUCT_ID, a.PRODUCT_NAME, a.CATEGORY_LARGE,
+        b.PRODUCT_ID, b.PRODUCT_NAME, b.CATEGORY_LARGE,
+        pc_a.total_baskets, pc_b.total_baskets, tb.total
+    HAVING COUNT(DISTINCT a.BASKET_ID) >= {min_count}
+    ORDER BY CO_PURCHASE_COUNT DESC
+    LIMIT {limit}
+    """
+    return session.sql(query).to_pandas()
+
+
+@st.cache_data(ttl=60)
+def get_related_products(product_id, where_conditions, limit=10):
+    """特定商品の関連商品を取得"""
+    where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+    
+    query = f"""
+    WITH target_baskets AS (
+        SELECT DISTINCT BASKET_ID
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS
+        WHERE PRODUCT_ID = '{product_id}'
+    ),
+    co_products AS (
+        SELECT 
+            t.PRODUCT_ID,
+            p.PRODUCT_NAME,
+            p.CATEGORY_LARGE,
+            p.BRAND_NAME,
+            COUNT(DISTINCT t.BASKET_ID) as CO_PURCHASE_COUNT
+        FROM FOODEX_DEMO.BUYER_AGENT.ID_POS_TRANSACTIONS t
+        JOIN FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER p ON t.PRODUCT_ID = p.PRODUCT_ID
+        JOIN FOODEX_DEMO.BUYER_AGENT.CUSTOMER_MASTER c ON t.CUSTOMER_ID = c.CUSTOMER_ID
+        WHERE t.BASKET_ID IN (SELECT BASKET_ID FROM target_baskets)
+          AND t.PRODUCT_ID != '{product_id}'
+          AND {where_clause}
+        GROUP BY t.PRODUCT_ID, p.PRODUCT_NAME, p.CATEGORY_LARGE, p.BRAND_NAME
+    )
+    SELECT *
+    FROM co_products
+    ORDER BY CO_PURCHASE_COUNT DESC
+    LIMIT {limit}
+    """
+    return session.sql(query).to_pandas()
+
+
+@st.cache_data(ttl=300)
+def get_product_list():
+    """商品一覧を取得"""
+    query = """
+    SELECT PRODUCT_ID, PRODUCT_NAME, CATEGORY_LARGE
+    FROM FOODEX_DEMO.BUYER_AGENT.PRODUCT_MASTER
+    ORDER BY CATEGORY_LARGE, PRODUCT_NAME
+    """
+    return session.sql(query).to_pandas()
+
+
 def get_download_link_csv(df, filename):
     """CSVダウンロードリンクを生成"""
     csv = df.to_csv(index=False, encoding='utf-8-sig')
@@ -453,10 +558,11 @@ with st.sidebar:
 
 
 # タブ構成
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "カスタム集計",
     "顧客セグメント分析",
-    "購買行動分析"
+    "購買行動分析",
+    "併売分析"
 ])
 
 # 共通のWHERE条件を構築（全タブで使用）
@@ -1067,6 +1173,286 @@ with tab3:
                 st.error(f"エラー: {str(e)}")
 
 
+# タブ4: 併売分析
+with tab4:
+    st.header("併売分析")
+    st.markdown("同じバスケットで一緒に購入される商品の関連性を分析します。")
+    
+    # 設定エリア
+    col_settings1, col_settings2, col_settings3 = st.columns(3)
+    
+    with col_settings1:
+        min_co_purchase = st.slider(
+            "最小併売回数",
+            min_value=10,
+            max_value=200,
+            value=50,
+            step=10,
+            help="この回数以上同時購入されたペアのみ表示"
+        )
+    
+    with col_settings2:
+        top_n_pairs = st.slider(
+            "表示ペア数",
+            min_value=10,
+            max_value=100,
+            value=30,
+            step=5
+        )
+    
+    with col_settings3:
+        view_mode = st.radio(
+            "表示モード",
+            ["ネットワークグラフ", "ランキング表"],
+            horizontal=True
+        )
+    
+    if st.button("併売分析を実行", type="primary", key="basket_analysis_btn"):
+        with st.spinner("併売データを分析中..."):
+            try:
+                co_purchase_df = get_co_purchase_pairs(
+                    common_where_conditions, 
+                    min_count=min_co_purchase, 
+                    limit=top_n_pairs
+                )
+                
+                if co_purchase_df.empty:
+                    st.warning("条件に該当する併売データがありませんでした。最小併売回数を下げてみてください。")
+                else:
+                    st.session_state['co_purchase_df'] = co_purchase_df
+                    
+                    # サマリー表示
+                    st.success(f"{len(co_purchase_df)}件の併売ペアを検出しました")
+                    
+                    metric_cols = st.columns(4)
+                    with metric_cols[0]:
+                        st.metric("併売ペア数", f"{len(co_purchase_df):,}")
+                    with metric_cols[1]:
+                        st.metric("最大併売回数", f"{co_purchase_df['CO_PURCHASE_COUNT'].max():,}")
+                    with metric_cols[2]:
+                        st.metric("平均リフト値", f"{co_purchase_df['LIFT'].mean():.2f}")
+                    with metric_cols[3]:
+                        unique_products = len(set(co_purchase_df['PRODUCT_A'].tolist() + co_purchase_df['PRODUCT_B'].tolist()))
+                        st.metric("関連商品数", f"{unique_products}")
+                    
+                    if view_mode == "ネットワークグラフ":
+                        st.subheader("商品関連性ネットワーク")
+                        st.caption("ノード = 商品、線の太さ = 併売回数、色 = カテゴリ")
+                        
+                        # ノードデータ作成
+                        nodes = {}
+                        for _, row in co_purchase_df.iterrows():
+                            if row['PRODUCT_A'] not in nodes:
+                                nodes[row['PRODUCT_A']] = {'category': row['CATEGORY_A'], 'connections': 0, 'weight': 0}
+                            if row['PRODUCT_B'] not in nodes:
+                                nodes[row['PRODUCT_B']] = {'category': row['CATEGORY_B'], 'connections': 0, 'weight': 0}
+                            nodes[row['PRODUCT_A']]['connections'] += 1
+                            nodes[row['PRODUCT_B']]['connections'] += 1
+                            nodes[row['PRODUCT_A']]['weight'] += row['CO_PURCHASE_COUNT']
+                            nodes[row['PRODUCT_B']]['weight'] += row['CO_PURCHASE_COUNT']
+                        
+                        # ノード配置（円形レイアウト）
+                        node_list = list(nodes.keys())
+                        n_nodes = len(node_list)
+                        
+                        node_df = pd.DataFrame([
+                            {
+                                'product': name,
+                                'category': data['category'],
+                                'connections': data['connections'],
+                                'weight': data['weight'],
+                                'x': 400 + 300 * math.cos(2 * math.pi * i / n_nodes),
+                                'y': 300 + 250 * math.sin(2 * math.pi * i / n_nodes),
+                                'size': min(50, max(15, data['connections'] * 8))
+                            }
+                            for i, (name, data) in enumerate(nodes.items())
+                        ])
+                        
+                        # エッジデータ作成
+                        edge_data = []
+                        max_count = co_purchase_df['CO_PURCHASE_COUNT'].max()
+                        for _, row in co_purchase_df.iterrows():
+                            idx_a = node_list.index(row['PRODUCT_A'])
+                            idx_b = node_list.index(row['PRODUCT_B'])
+                            x_a = 400 + 300 * math.cos(2 * math.pi * idx_a / n_nodes)
+                            y_a = 300 + 250 * math.sin(2 * math.pi * idx_a / n_nodes)
+                            x_b = 400 + 300 * math.cos(2 * math.pi * idx_b / n_nodes)
+                            y_b = 300 + 250 * math.sin(2 * math.pi * idx_b / n_nodes)
+                            edge_data.append({
+                                'x': x_a, 'y': y_a, 'x2': x_b, 'y2': y_b,
+                                'product_a': row['PRODUCT_A'],
+                                'product_b': row['PRODUCT_B'],
+                                'count': row['CO_PURCHASE_COUNT'],
+                                'lift': row['LIFT'],
+                                'stroke_width': max(1, (row['CO_PURCHASE_COUNT'] / max_count) * 8)
+                            })
+                        
+                        edge_df = pd.DataFrame(edge_data)
+                        
+                        # カテゴリ別カラースキーム
+                        categories = node_df['category'].unique().tolist()
+                        color_scheme = ['#dc2626', '#2563eb', '#16a34a', '#ca8a04', '#9333ea', '#0891b2', '#be185d', '#65a30d']
+                        
+                        # エッジ描画
+                        edges = alt.Chart(edge_df).mark_rule(opacity=0.4).encode(
+                            x=alt.X('x:Q', scale=alt.Scale(domain=[0, 800]), axis=None),
+                            y=alt.Y('y:Q', scale=alt.Scale(domain=[0, 600]), axis=None),
+                            x2='x2:Q',
+                            y2='y2:Q',
+                            strokeWidth=alt.StrokeWidth('stroke_width:Q', legend=None),
+                            color=alt.value('#94a3b8'),
+                            tooltip=[
+                                alt.Tooltip('product_a:N', title='商品A'),
+                                alt.Tooltip('product_b:N', title='商品B'),
+                                alt.Tooltip('count:Q', title='併売回数'),
+                                alt.Tooltip('lift:Q', title='リフト値')
+                            ]
+                        )
+                        
+                        # ノード描画
+                        nodes_chart = alt.Chart(node_df).mark_circle().encode(
+                            x=alt.X('x:Q', axis=None),
+                            y=alt.Y('y:Q', axis=None),
+                            size=alt.Size('size:Q', scale=alt.Scale(range=[200, 1500]), legend=None),
+                            color=alt.Color('category:N', 
+                                scale=alt.Scale(domain=categories, range=color_scheme[:len(categories)]),
+                                legend=alt.Legend(title='カテゴリ', orient='right')
+                            ),
+                            tooltip=[
+                                alt.Tooltip('product:N', title='商品名'),
+                                alt.Tooltip('category:N', title='カテゴリ'),
+                                alt.Tooltip('connections:Q', title='関連商品数'),
+                                alt.Tooltip('weight:Q', title='総併売回数')
+                            ]
+                        )
+                        
+                        # ラベル描画
+                        labels = alt.Chart(node_df).mark_text(
+                            fontSize=9,
+                            fontWeight='bold',
+                            dy=-20
+                        ).encode(
+                            x='x:Q',
+                            y='y:Q',
+                            text=alt.Text('product:N'),
+                            color=alt.value('#1f2937')
+                        )
+                        
+                        # グラフ合成
+                        network_chart = (edges + nodes_chart + labels).properties(
+                            width=750,
+                            height=550,
+                            title=alt.TitleParams(
+                                text='商品併売ネットワーク',
+                                subtitle='線が太いほど併売回数が多い / ノードが大きいほど関連商品が多い',
+                                fontSize=16,
+                                subtitleFontSize=11,
+                                subtitleColor='#64748b'
+                            )
+                        ).configure_view(
+                            strokeWidth=0
+                        )
+                        
+                        st.altair_chart(network_chart, use_container_width=True)
+                        
+                        # カテゴリ別凡例の補足
+                        st.markdown("---")
+                        st.markdown("**TOP5 併売ペア**")
+                        top5 = co_purchase_df.head(5)[['PRODUCT_A', 'PRODUCT_B', 'CO_PURCHASE_COUNT', 'LIFT']]
+                        top5.columns = ['商品A', '商品B', '併売回数', 'リフト値']
+                        st.dataframe(top5, use_container_width=True, hide_index=True)
+                    
+                    else:  # ランキング表
+                        st.subheader("併売ペアランキング")
+                        
+                        display_df = co_purchase_df[[
+                            'PRODUCT_A', 'CATEGORY_A', 'PRODUCT_B', 'CATEGORY_B', 
+                            'CO_PURCHASE_COUNT', 'CONFIDENCE_A_TO_B', 'CONFIDENCE_B_TO_A', 'LIFT'
+                        ]].copy()
+                        display_df.columns = [
+                            '商品A', 'カテゴリA', '商品B', 'カテゴリB',
+                            '併売回数', '信頼度(A→B)%', '信頼度(B→A)%', 'リフト値'
+                        ]
+                        
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        
+                        # リフト値の解説
+                        st.info("""
+                        **指標の見方**
+                        - **併売回数**: 同じバスケットで購入された回数
+                        - **信頼度(A→B)**: 商品Aを買った人のうち、商品Bも買った割合(%)
+                        - **リフト値**: 1より大きいほど偶然以上に一緒に買われやすい（2.0 = 2倍買われやすい）
+                        """)
+                        
+                        # ダウンロード
+                        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        csv_link = get_download_link_csv(display_df, f"co_purchase_analysis_{current_time}.csv")
+                        st.markdown(csv_link, unsafe_allow_html=True)
+                
+            except Exception as e:
+                st.error(f"エラーが発生しました: {str(e)}")
+    
+    # 商品指定の関連商品検索
+    st.markdown("---")
+    st.subheader("商品指定 関連商品検索")
+    st.markdown("特定の商品を選択して、一緒に買われやすい商品を探します。")
+    
+    product_list_df = get_product_list()
+    product_options = {
+        f"{row['PRODUCT_NAME']} [{row['CATEGORY_LARGE']}]": row['PRODUCT_ID']
+        for _, row in product_list_df.iterrows()
+    }
+    
+    selected_product = st.selectbox(
+        "商品を選択",
+        options=[""] + list(product_options.keys()),
+        key="related_product_select"
+    )
+    
+    if selected_product and st.button("関連商品を検索", key="related_search_btn"):
+        product_id = product_options[selected_product]
+        with st.spinner("関連商品を検索中..."):
+            try:
+                related_df = get_related_products(product_id, common_where_conditions, limit=15)
+                
+                if related_df.empty:
+                    st.warning("関連商品が見つかりませんでした。")
+                else:
+                    st.success(f"「{selected_product.split(' [')[0]}」と一緒に買われる商品 TOP{len(related_df)}")
+                    
+                    # 横棒グラフ
+                    bar_chart = alt.Chart(related_df.head(10)).mark_bar(
+                        cornerRadiusEnd=4,
+                        color='#dc2626'
+                    ).encode(
+                        x=alt.X('CO_PURCHASE_COUNT:Q', title='併売回数'),
+                        y=alt.Y('PRODUCT_NAME:N', sort='-x', title='商品名'),
+                        color=alt.Color('CATEGORY_LARGE:N', 
+                            legend=alt.Legend(title='カテゴリ'),
+                            scale=alt.Scale(scheme='category10')
+                        ),
+                        tooltip=[
+                            alt.Tooltip('PRODUCT_NAME:N', title='商品名'),
+                            alt.Tooltip('CATEGORY_LARGE:N', title='カテゴリ'),
+                            alt.Tooltip('BRAND_NAME:N', title='ブランド'),
+                            alt.Tooltip('CO_PURCHASE_COUNT:Q', title='併売回数')
+                        ]
+                    ).properties(
+                        height=350,
+                        title=f'「{selected_product.split(" [")[0]}」の関連商品'
+                    )
+                    
+                    st.altair_chart(bar_chart, use_container_width=True)
+                    
+                    # テーブル表示
+                    display_related = related_df[['PRODUCT_NAME', 'CATEGORY_LARGE', 'BRAND_NAME', 'CO_PURCHASE_COUNT']].copy()
+                    display_related.columns = ['商品名', 'カテゴリ', 'ブランド', '併売回数']
+                    st.dataframe(display_related, use_container_width=True, hide_index=True)
+                    
+            except Exception as e:
+                st.error(f"エラー: {str(e)}")
+
+
 # フッター
 st.markdown("---")
 st.markdown("""
@@ -1076,6 +1462,7 @@ st.markdown("""
 <li><b>カスタム集計</b>: 集計軸と集計項目を自由に選択して柔軟な分析が可能</li>
 <li><b>顧客セグメント分析</b>: 事前定義されたセグメント別の分析を即座に実行</li>
 <li><b>購買行動分析</b>: 顧客の購買パターンを様々な切り口で分析</li>
+<li><b>併売分析</b>: 一緒に買われやすい商品をネットワークグラフで可視化</li>
 <li>各タブの分析結果はCSV/Excelでダウンロード可能</li>
 </ul>
 </div>

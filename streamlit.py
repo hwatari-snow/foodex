@@ -149,6 +149,32 @@ body *:not(script):not(style) {
     color: #3b82f6;
 }
 
+/* ---------- Intelligenceボタン ---------- */
+.intelligence-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+    color: white !important;
+    padding: 12px 24px;
+    border-radius: 12px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-decoration: none;
+    box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+    transition: all 0.3s ease;
+    border: none;
+}
+.intelligence-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
+    color: white !important;
+    text-decoration: none;
+}
+.intelligence-btn .sparkle {
+    font-size: 1.1rem;
+}
+
 /* ---------- サンプル質問ボタン ---------- */
 div[data-testid="stColumns"] .stButton > button {
     width: 100%;
@@ -613,10 +639,33 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # ヘッダー
 # ---------------------------------------------------------------------------
-st.markdown("""
+# Snowflake Intelligence URLを動的に生成
+@st.cache_data(ttl=3600)
+def get_intelligence_url():
+    """現在のアカウント情報からIntelligence URLを生成"""
+    result = session.sql("""
+        SELECT 
+            CURRENT_ORGANIZATION_NAME() as ORG_NAME,
+            CURRENT_ACCOUNT_NAME() as ACCOUNT_NAME
+    """).collect()
+    org_name = result[0]["ORG_NAME"].lower()
+    account_name = result[0]["ACCOUNT_NAME"].lower()
+    return f"https://ai.snowflake.com/{org_name}/{account_name}"
+
+INTELLIGENCE_URL = get_intelligence_url()
+
+st.markdown(f"""
 <div class="dashboard-header">
-    <h1>Foodex Buyer Dashboard</h1>
-    <p>小売バイヤー向け  売上・在庫・商品 統合分析プラットフォーム</p>
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; position: relative;">
+        <div>
+            <h1>Foodex Buyer Dashboard</h1>
+            <p>小売バイヤー向け  売上・在庫・商品 統合分析プラットフォーム</p>
+        </div>
+        <a href="{INTELLIGENCE_URL}" target="_blank" class="intelligence-btn">
+            <span class="sparkle">✨</span>
+            Intelligenceに聞いてみる
+        </a>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
